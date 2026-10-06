@@ -1,0 +1,40 @@
+workflows:
+  high4tik:
+    name: High4Tik
+    instance_type: mac_mini_m2
+    max_build_duration: 30
+    environment:
+      xcode: latest
+    scripts:
+      - name: Generate app icon
+        script: |
+          D=App/Assets.xcassets/AppIcon.appiconset
+          mkdir -p "$D"
+          sips -z 1024 1024 -s format png icon.jpeg --out "$D/icon.png"
+          echo '{"info":{"author":"xcode","version":1}}' > App/Assets.xcassets/Contents.json
+          echo '{"images":[{"filename":"icon.png","idiom":"universal","platform":"ios","size":"1024x1024"}],"info":{"author":"xcode","version":1}}' > "$D/Contents.json"
+      - name: Install XcodeGen
+        script: brew install xcodegen
+      - name: Generate Xcode project
+        script: |
+          SPEC=project.yml
+          [ -f project.yaml ] && SPEC=project.yaml
+          xcodegen generate --spec "$SPEC"
+      - name: Build unsigned app
+        script: |
+          xcodebuild -project High4Tik.xcodeproj \
+            -scheme High4Tik \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build
+      - name: Package IPA
+        script: |
+          mkdir Payload
+          cp -R build/Build/Products/Release-iphoneos/High4Tik.app Payload/
+          zip -qr High4Tik.ipa Payload
+    artifacts:
+      - High4Tik.ipa
