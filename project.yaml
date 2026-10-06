@@ -2,7 +2,7 @@ name: High4Tik
 options:
   bundleIdPrefix: com.abdtench
   deploymentTarget:
-    iOS: "16.0"
+    iOS: "16.1"
 targets:
   High4Tik:
     type: application
