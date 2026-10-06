@@ -1,1 +1,54 @@
-// placeholder
+name: Build IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Use newest Xcode (for Liquid Glass)
+        run: sudo xcode-select -s "$(ls -d /Applications/Xcode_26*.app | sort | tail -1)" || true
+
+      - name: Generate app icon
+        run: |
+          set -e
+          D=App/Assets.xcassets/AppIcon.appiconset
+          mkdir -p "$D"
+          sips -z 1024 1024 -s format png icon.jpeg --out "$D/icon.png"
+          echo '{"info":{"author":"xcode","version":1}}' > App/Assets.xcassets/Contents.json
+          echo '{"images":[{"filename":"icon.png","idiom":"universal","platform":"ios","size":"1024x1024"}],"info":{"author":"xcode","version":1}}' > "$D/Contents.json"
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Build (unsigned)
+        run: |
+          xcodebuild -project High4Tik.xcodeproj \
+            -scheme High4Tik \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build
+
+      - name: Package IPA
+        run: |
+          mkdir Payload
+          cp -R build/Build/Products/Release-iphoneos/High4Tik.app Payload/
+          zip -qr High4Tik.ipa Payload
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: High4Tik-ipa
+          path: High4Tik.ipa
