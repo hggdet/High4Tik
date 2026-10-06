@@ -22,8 +22,9 @@ struct PickedMovie: Transferable {
             contentType: .movie,
             exporting: { SentTransferredFile($0.url) },
             importing: { received in
+                let ext = received.file.pathExtension.isEmpty ? "mov" : received.file.pathExtension
                 let dst = FileManager.default.temporaryDirectory
-                    .appendingPathComponent("in_\(UUID().uuidString).mov")
+                    .appendingPathComponent("in_\(UUID().uuidString).\(ext)")
                 try FileManager.default.copyItem(at: received.file, to: dst)
                 return PickedMovie(url: dst)
             }
@@ -54,6 +55,20 @@ extension View {
     }
 }
 
+struct WhitePill: View {
+    var body: some View {
+        #if compiler(>=6.2)
+        if #available(iOS 26.0, *) {
+            Color.clear.glassEffect(Glass.regular.tint(Color.white.opacity(0.85)), in: Capsule())
+        } else {
+            Capsule().fill(Color.white).shadow(color: .black.opacity(0.12), radius: 4, y: 1)
+        }
+        #else
+        Capsule().fill(Color.white).shadow(color: .black.opacity(0.12), radius: 4, y: 1)
+        #endif
+    }
+}
+
 struct Seg<T: Hashable>: View {
     let items: [(String, T)]
     @Binding var sel: T
@@ -65,14 +80,14 @@ struct Seg<T: Hashable>: View {
                     .font(.system(.subheadline, design: .rounded).weight(.semibold))
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 12)
-                    .foregroundStyle(on ? Color(uiColor: .systemBackground) : Color.primary)
-                    .background(on ? Color.primary : Color.clear, in: Capsule())
+                    .foregroundStyle(on ? Color.black : Color.primary)
+                    .background { if on { WhitePill() } }
                     .contentShape(Capsule())
                     .onTapGesture { withAnimation(.easeOut(duration: 0.2)) { sel = items[i].1 } }
             }
         }
         .padding(4)
-        .glass(Capsule())
+        .background(Color(uiColor: .systemGray5), in: Capsule())
     }
 }
 
@@ -95,28 +110,43 @@ struct ContentView: View {
     @State private var mbps = 40
     @State private var progress = 0.0
     @State private var busy = false
+    @State private var loading = false
     @State private var failed = false
     @State private var status = ""
     @State private var result: URL?
 
     var body: some View {
         ZStack {
-            Color(uiColor: .systemBackground)
-            RadialGradient(colors: [Color.primary.opacity(0.10), .clear],
-                           center: .top, startRadius: 0, endRadius: 460)
+            ZStack {
+                Color(uiColor: .systemBackground)
+                RadialGradient(colors: [Color.primary.opacity(0.10), .clear],
+                               center: .top, startRadius: 0, endRadius: 460)
+            }
+            .ignoresSafeArea()
+            GeometryReader { geo in
+                ScrollView { content.frame(minHeight: geo.size.height) }
+                    .scrollIndicators(.hidden)
+            }
         }
-        .ignoresSafeArea()
-        .overlay(alignment: .top) { content }
         .fontDesign(.rounded)
         .environment(\.layoutDirection, isArabic ? .rightToLeft : .leftToRight)
-        .onChange(of: item) { _ in
+        .onChange(of: item) { new in
+            guard let new = new else { return }
+            loading = true
+            failed = false
+            status = ""
             Task {
-                guard let m = try? await item?.loadTransferable(type: PickedMovie.self) else { return }
-                movie = m.url
-                result = nil
-                progress = 0
-                status = ""
-                thumb = await makeThumb(m.url)
+                if let m = try? await new.loadTransferable(type: PickedMovie.self) {
+                    movie = m.url
+                    result = nil
+                    progress = 0
+                    thumb = await makeThumb(m.url)
+                } else {
+                    failed = true
+                    status = t("ما انحمّل المقطع، جرّب مرة ثانية", "Couldn't load the video, try again")
+                }
+                loading = false
+                item = nil
             }
         }
     }
@@ -128,10 +158,14 @@ struct ContentView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.bottom, 4)
 
-            PhotosPicker(selection: $item, matching: .videos) {
+            PhotosPicker(selection: $item, matching: .videos, preferredItemEncoding: .current) {
                 ZStack {
                     if let img = thumb {
-                        Image(uiImage: img).resizable().scaledToFill()
+                        Image(uiImage: img)
+                            .resizable()
+                            .scaledToFit()
+                            .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
+                            .padding(12)
                     } else {
                         VStack(spacing: 10) {
                             Image(systemName: "video.badge.plus")
@@ -140,12 +174,14 @@ struct ContentView: View {
                         }
                         .foregroundStyle(Color.primary)
                     }
+                    if loading { ProgressView().controlSize(.large) }
                 }
                 .frame(maxWidth: .infinity)
-                .frame(height: 300)
+                .frame(height: 280)
                 .clipShape(RoundedRectangle(cornerRadius: 32, style: .continuous))
             }
             .buttonStyle(.plain)
+            .disabled(busy || loading)
             .glass(RoundedRectangle(cornerRadius: 32, style: .continuous), interactive: true)
 
             Seg(items: [("4K", 3840), ("2K", 2560)], sel: $side)
@@ -160,9 +196,31 @@ struct ContentView: View {
                     .foregroundStyle(failed ? Color.red : Color.secondary)
                     .multilineTextAlignment(.center)
             }
+
+            Spacer(minLength: 16)
+
+            VStack(spacing: 10) {
+                Text(t("عبدالباسط خضير", "Abdul Basit Khudair"))
+                    .font(.subheadline.weight(.semibold))
+                HStack(spacing: 10) {
+                    socialLink("Telegram", "paperplane.fill", "https://t.me/ipafilesfor")
+                    socialLink("TikTok", "music.note", "https://www.tiktok.com/@087.n")
+                }
+            }
+            .padding(.top, 4)
         }
         .padding(20)
-        .disabled(false)
+    }
+
+    func socialLink(_ title: String, _ icon: String, _ url: String) -> some View {
+        Link(destination: URL(string: url)!) {
+            Label(title, systemImage: icon)
+                .font(.footnote.weight(.semibold))
+                .foregroundStyle(Color.primary)
+                .padding(.horizontal, 16)
+                .padding(.vertical, 10)
+        }
+        .glass(Capsule(), interactive: true)
     }
 
     @ViewBuilder var actions: some View {
@@ -186,7 +244,7 @@ struct ContentView: View {
                         .frame(height: 60)
                         .background(Color.primary, in: Capsule())
                 }
-                .disabled(movie == nil)
+                .disabled(movie == nil || loading)
                 .opacity(movie == nil ? 0.35 : 1)
 
                 if let r = result {
@@ -277,7 +335,9 @@ enum Converter {
         let k = CGFloat(opt.longSide) / max(w, h)
         let W = Int((w * k / 2).rounded()) * 2
         let H = Int((h * k / 2).rounded()) * 2
-        let fps = Int(min(max(fpsRaw.rounded(), 24), 60))
+        let minDur = try await vt.load(.minFrameDuration)
+        let fromMin = (minDur.isNumeric && minDur.seconds > 0) ? Int((1.0 / minDur.seconds).rounded()) : 0
+        let fps = min(max(Int(fpsRaw.rounded()), fromMin, 24), 60)
 
         // Video composition: rotate + scale
         let layer = AVMutableVideoCompositionLayerInstruction(assetTrack: vt)
@@ -289,6 +349,9 @@ enum Converter {
         comp.renderSize = CGSize(width: W, height: H)
         comp.frameDuration = CMTime(value: 1, timescale: CMTimeScale(fps))
         comp.instructions = [instr]
+        comp.colorPrimaries = AVVideoColorPrimaries_ITU_R_709_2
+        comp.colorTransferFunction = AVVideoTransferFunction_ITU_R_709_2
+        comp.colorYCbCrMatrix = AVVideoYCbCrMatrix_ITU_R_709_2
 
         // Reader
         let reader = try AVAssetReader(asset: asset)
@@ -323,7 +386,12 @@ enum Converter {
             AVVideoCodecKey: opt.codec == .hevc ? AVVideoCodecType.hevc : AVVideoCodecType.h264,
             AVVideoWidthKey: W,
             AVVideoHeightKey: H,
-            AVVideoCompressionPropertiesKey: props
+            AVVideoCompressionPropertiesKey: props,
+            AVVideoColorPropertiesKey: [
+                AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_709_2,
+                AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_709_2,
+                AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_709_2
+            ]
         ]
         let vIn = AVAssetWriterInput(mediaType: .video, outputSettings: vSettings)
         vIn.expectsMediaDataInRealTime = false
