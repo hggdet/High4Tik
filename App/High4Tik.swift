@@ -3,6 +3,9 @@ import PhotosUI
 import AVFoundation
 import Photos
 import UIKit
+import VideoToolbox
+import CoreImage
+import CoreImage.CIFilterBuiltins
 
 // MARK: - App
 
@@ -56,10 +59,13 @@ extension View {
 }
 
 struct WhitePill: View {
+    @Environment(\.colorScheme) private var scheme
     var body: some View {
         #if compiler(>=6.2)
         if #available(iOS 26.0, *) {
-            Color.clear.glassEffect(Glass.regular.tint(Color.white.opacity(0.85)), in: Capsule())
+            Color.clear.glassEffect(
+                Glass.regular.tint(Color.white.opacity(scheme == .dark ? 0.8 : 0.5)),
+                in: Capsule())
         } else {
             Capsule().fill(Color.white).shadow(color: .black.opacity(0.12), radius: 4, y: 1)
         }
@@ -72,6 +78,7 @@ struct WhitePill: View {
 struct Seg<T: Hashable>: View {
     let items: [(String, T)]
     @Binding var sel: T
+    @Namespace private var ns
     var body: some View {
         HStack(spacing: 4) {
             ForEach(items.indices, id: \.self) { i in
@@ -81,9 +88,17 @@ struct Seg<T: Hashable>: View {
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 12)
                     .foregroundStyle(on ? Color.black : Color.primary)
-                    .background { if on { WhitePill() } }
+                    .background {
+                        if on { WhitePill().matchedGeometryEffect(id: "pill", in: ns) }
+                    }
                     .contentShape(Capsule())
-                    .onTapGesture { withAnimation(.easeOut(duration: 0.2)) { sel = items[i].1 } }
+                    .onTapGesture {
+                        guard !on else { return }
+                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                        withAnimation(.spring(response: 0.38, dampingFraction: 0.78)) {
+                            sel = items[i].1
+                        }
+                    }
             }
         }
         .padding(4)
@@ -105,10 +120,10 @@ struct ContentView: View {
     @State private var item: PhotosPickerItem?
     @State private var movie: URL?
     @State private var thumb: UIImage?
-    @State private var mode: ProcessingMode = .original
     @State private var codec: Codec = .hevc
     @State private var side = 3840
     @State private var mbps = 40
+    @State private var sharpen = true
     @State private var progress = 0.0
     @State private var busy = false
     @State private var loading = false
@@ -185,25 +200,10 @@ struct ContentView: View {
             .disabled(busy || loading)
             .glass(RoundedRectangle(cornerRadius: 32, style: .continuous), interactive: true)
 
-            Seg(items: [(t("الأصل كما هو", "Keep original"), ProcessingMode.original),
-                        (t("تحويل اختياري", "Convert"), ProcessingMode.convert)], sel: $mode)
-
-            if mode == .original {
-                Text(t("سيُحفظ الملف المحدد دون إعادة ترميز أو تغيير دقته من التطبيق.",
-                       "The selected file will be saved without re-encoding or changing its resolution."))
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
-                    .multilineTextAlignment(.center)
-            } else {
-                Text(t("التحويل ينشئ نسخة جديدة وقد لا يضيف تفاصيل حقيقية للفيديو.",
-                       "Conversion creates a new copy and cannot add real detail to the video."))
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
-                    .multilineTextAlignment(.center)
-                Seg(items: [("4K", 3840), ("2K", 2560)], sel: $side)
-                Seg(items: [("HEVC", Codec.hevc), ("H.264", Codec.h264)], sel: $codec)
-                Seg(items: [("25 Mbps", 25), ("40 Mbps", 40), ("60 Mbps", 60)], sel: $mbps)
-            }
+            Seg(items: [("4K", 3840), ("2K", 2560)], sel: $side)
+            Seg(items: [("HEVC", Codec.hevc), ("H.264", Codec.h264)], sel: $codec)
+            Seg(items: [("40 Mbps", 40), ("60 Mbps", 60)], sel: $mbps)
+            Seg(items: [(t("حدة", "Sharp"), true), (t("بدون", "Off"), false)], sel: $sharpen)
 
             actions.padding(.top, 6)
 
@@ -234,8 +234,7 @@ struct ContentView: View {
             Label(title, systemImage: icon)
                 .font(.footnote.weight(.semibold))
                 .foregroundStyle(Color.primary)
-                .padding(.horizontal, 16)
-                .padding(.vertical, 10)
+                .frame(width: 132, height: 44)
         }
         .glass(Capsule(), interactive: true)
     }
@@ -287,20 +286,11 @@ struct ContentView: View {
         UIApplication.shared.isIdleTimerDisabled = true
         var bg = UIBackgroundTaskIdentifier.invalid
         bg = UIApplication.shared.beginBackgroundTask { }
-        let opt = Options(codec: codec, longSide: side, mbps: mbps)
+        let opt = Options(codec: codec, longSide: side, mbps: mbps, sharpen: sharpen)
         Task {
             do {
-                let out: URL
-                if mode == .original {
-                    let ext = input.pathExtension.isEmpty ? "mov" : input.pathExtension
-                    out = FileManager.default.temporaryDirectory
-                        .appendingPathComponent("High4Tik_original_\(UUID().uuidString).\(ext)")
-                    try FileManager.default.copyItem(at: input, to: out)
-                    progress = 0.9
-                } else {
-                    out = try await Converter.run(input: input, opt: opt) { p in
-                        DispatchQueue.main.async { progress = p }
-                    }
+                let out = try await Converter.run(input: input, opt: opt) { p in
+                    DispatchQueue.main.async { progress = p }
                 }
                 try await saveToPhotos(out)
                 result = out
@@ -333,12 +323,11 @@ struct ContentView: View {
 
 enum Codec: String, CaseIterable { case hevc = "HEVC", h264 = "H.264" }
 
-enum ProcessingMode: Hashable { case original, convert }
-
 struct Options {
     var codec: Codec
     var longSide: Int
     var mbps: Int
+    var sharpen: Bool
 }
 
 enum Converter {
@@ -357,6 +346,15 @@ enum Converter {
         let fpsRaw = try await vt.load(.nominalFrameRate)
         let at = try await asset.loadTracks(withMediaType: .audio).first
 
+        // HDR detection (iPhone videos are often HLG / Dolby Vision)
+        let fds = try await vt.load(.formatDescriptions)
+        let tfv = fds.first.flatMap {
+            CMFormatDescriptionGetExtension($0, extensionKey: kCMFormatDescriptionExtension_TransferFunction) as? String
+        }
+        let isPQ = tfv == (kCMFormatDescriptionTransferFunction_SMPTE_ST_2084_PQ as String)
+        let isHLG = tfv == (kCMFormatDescriptionTransferFunction_ITU_R_2100_HLG as String)
+        let hdr = isPQ || isHLG
+
         // Display size after rotation, then scale so the long side = target
         let disp = natural.applying(pt)
         let w = abs(disp.width), h = abs(disp.height)
@@ -368,25 +366,66 @@ enum Converter {
         let fps = min(max(Int(fpsRaw.rounded()), fromMin, 24), 60)
 
         // Video composition: rotate + scale
-        let layer = AVMutableVideoCompositionLayerInstruction(assetTrack: vt)
-        layer.setTransform(pt.concatenating(CGAffineTransform(scaleX: k, y: k)), at: .zero)
-        let instr = AVMutableVideoCompositionInstruction()
-        instr.timeRange = CMTimeRange(start: .zero, duration: duration)
-        instr.layerInstructions = [layer]
-        let comp = AVMutableVideoComposition()
+        let comp: AVMutableVideoComposition
+        if hdr {
+            // HDR: keep the simple transform path (no filters) to protect the colours
+            let layer = AVMutableVideoCompositionLayerInstruction(assetTrack: vt)
+            layer.setTransform(pt.concatenating(CGAffineTransform(scaleX: k, y: k)), at: .zero)
+            let instr = AVMutableVideoCompositionInstruction()
+            instr.timeRange = CMTimeRange(start: .zero, duration: duration)
+            instr.layerInstructions = [layer]
+            comp = AVMutableVideoComposition()
+            comp.instructions = [instr]
+        } else {
+            // SDR: Lanczos upscale (much crisper than bilinear) + very mild sharpening
+            let ci = CIContext(options: [.workingFormat: CIFormat.RGBAh])
+            let doSharpen = opt.sharpen
+            let tw = CGFloat(W), th = CGFloat(H)
+            comp = AVMutableVideoComposition(asset: asset) { req in
+                var img = req.sourceImage
+                img = img.transformed(by: CGAffineTransform(translationX: -img.extent.minX, y: -img.extent.minY))
+                let sc = tw / max(img.extent.width, 1)
+                let lz = CIFilter.lanczosScaleTransform()
+                lz.inputImage = img
+                lz.scale = Float(sc)
+                lz.aspectRatio = 1
+                var out = lz.outputImage ?? img
+                if doSharpen {
+                    let um = CIFilter.unsharpMask()
+                    um.inputImage = out
+                    um.radius = 2.0
+                    um.intensity = 0.45
+                    out = um.outputImage ?? out
+                }
+                out = out.cropped(to: CGRect(x: 0, y: 0, width: tw, height: th))
+                req.finish(with: out, context: ci)
+            }
+        }
         comp.renderSize = CGSize(width: W, height: H)
         comp.frameDuration = CMTime(value: 1, timescale: CMTimeScale(fps))
-        comp.instructions = [instr]
-        comp.colorPrimaries = AVVideoColorPrimaries_ITU_R_709_2
-        comp.colorTransferFunction = AVVideoTransferFunction_ITU_R_709_2
-        comp.colorYCbCrMatrix = AVVideoYCbCrMatrix_ITU_R_709_2
+        // Copy the source's own colour tags so colours stay identical
+        func srcExt(_ key: CFString) -> String? {
+            fds.first.flatMap { CMFormatDescriptionGetExtension($0, extensionKey: key) as? String }
+        }
+        let okPrim: Set<String> = [AVVideoColorPrimaries_ITU_R_709_2, AVVideoColorPrimaries_ITU_R_2020, AVVideoColorPrimaries_P3_D65]
+        let okTrans: Set<String> = [AVVideoTransferFunction_ITU_R_709_2, AVVideoTransferFunction_ITU_R_2100_HLG, AVVideoTransferFunction_SMPTE_ST_2084_PQ]
+        let okMat: Set<String> = [AVVideoYCbCrMatrix_ITU_R_709_2, AVVideoYCbCrMatrix_ITU_R_2020, AVVideoYCbCrMatrix_ITU_R_601_4]
+        let cPrim = srcExt(kCMFormatDescriptionExtension_ColorPrimaries).flatMap { okPrim.contains($0) ? $0 : nil }
+            ?? (hdr ? AVVideoColorPrimaries_ITU_R_2020 : AVVideoColorPrimaries_ITU_R_709_2)
+        let cTrans = tfv.flatMap { okTrans.contains($0) ? $0 : nil }
+            ?? AVVideoTransferFunction_ITU_R_709_2
+        let cMat = srcExt(kCMFormatDescriptionExtension_YCbCrMatrix).flatMap { okMat.contains($0) ? $0 : nil }
+            ?? (hdr ? AVVideoYCbCrMatrix_ITU_R_2020 : AVVideoYCbCrMatrix_ITU_R_709_2)
+        comp.colorPrimaries = cPrim
+        comp.colorTransferFunction = cTrans
+        comp.colorYCbCrMatrix = cMat
 
         // Reader
         let reader = try AVAssetReader(asset: asset)
         let vOut = AVAssetReaderVideoCompositionOutput(
             videoTracks: [vt],
             videoSettings: [kCVPixelBufferPixelFormatTypeKey as String:
-                                kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange])
+                                (hdr ? kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)])
         vOut.videoComposition = comp
         guard reader.canAdd(vOut) else { throw fail("فشل إعداد القراءة") }
         reader.add(vOut)
@@ -409,16 +448,21 @@ enum Converter {
             AVVideoExpectedSourceFrameRateKey: fps,
             AVVideoMaxKeyFrameIntervalKey: fps * 2
         ]
-        if opt.codec == .h264 { props[AVVideoProfileLevelKey] = AVVideoProfileLevelH264HighAutoLevel }
+        let useHEVC = hdr || opt.codec == .hevc
+        if hdr {
+            props[AVVideoProfileLevelKey] = kVTProfileLevel_HEVC_Main10_AutoLevel as String
+        } else if !useHEVC {
+            props[AVVideoProfileLevelKey] = AVVideoProfileLevelH264HighAutoLevel
+        }
         let vSettings: [String: Any] = [
-            AVVideoCodecKey: opt.codec == .hevc ? AVVideoCodecType.hevc : AVVideoCodecType.h264,
+            AVVideoCodecKey: useHEVC ? AVVideoCodecType.hevc : AVVideoCodecType.h264,
             AVVideoWidthKey: W,
             AVVideoHeightKey: H,
             AVVideoCompressionPropertiesKey: props,
             AVVideoColorPropertiesKey: [
-                AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_709_2,
-                AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_709_2,
-                AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_709_2
+                AVVideoColorPrimariesKey: cPrim,
+                AVVideoTransferFunctionKey: cTrans,
+                AVVideoYCbCrMatrixKey: cMat
             ]
         ]
         let vIn = AVAssetWriterInput(mediaType: .video, outputSettings: vSettings)
