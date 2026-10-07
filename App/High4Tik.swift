@@ -99,12 +99,34 @@ func makeThumb(_ url: URL) async -> UIImage? {
     return UIImage(cgImage: r.image)
 }
 
+struct VideoInfo {
+    let width: Int
+    let height: Int
+    let frameRate: Double
+
+    var longSide: Int { max(width, height) }
+}
+
+func inspectVideo(_ url: URL) async -> VideoInfo? {
+    let asset = AVURLAsset(url: url)
+    guard let tracks = try? await asset.loadTracks(withMediaType: .video),
+          let track = tracks.first,
+          let size = try? await track.load(.naturalSize),
+          let transform = try? await track.load(.preferredTransform),
+          let frameRate = try? await track.load(.nominalFrameRate) else { return nil }
+    let displaySize = size.applying(transform)
+    return VideoInfo(width: Int(abs(displaySize.width).rounded()),
+                     height: Int(abs(displaySize.height).rounded()),
+                     frameRate: Double(frameRate))
+}
+
 // MARK: - UI
 
 struct ContentView: View {
     @State private var item: PhotosPickerItem?
     @State private var movie: URL?
     @State private var thumb: UIImage?
+    @State private var videoInfo: VideoInfo?
     @State private var mode: ProcessingMode = .original
     @State private var codec: Codec = .hevc
     @State private var side = 3840
@@ -136,12 +158,17 @@ struct ContentView: View {
             loading = true
             failed = false
             status = ""
+            movie = nil
+            thumb = nil
+            videoInfo = nil
+            result = nil
             Task {
                 if let m = try? await new.loadTransferable(type: PickedMovie.self) {
                     movie = m.url
                     result = nil
                     progress = 0
                     thumb = await makeThumb(m.url)
+                    videoInfo = await inspectVideo(m.url)
                 } else {
                     failed = true
                     status = t("ما انحمّل المقطع، جرّب مرة ثانية", "Couldn't load the video, try again")
@@ -185,6 +212,18 @@ struct ContentView: View {
             .disabled(busy || loading)
             .glass(RoundedRectangle(cornerRadius: 32, style: .continuous), interactive: true)
 
+            if let videoInfo {
+                HStack(spacing: 18) {
+                    Label("\(videoInfo.width) × \(videoInfo.height)", systemImage: "rectangle.expand.vertical")
+                    Label(String(format: "%.0f FPS", videoInfo.frameRate), systemImage: "speedometer")
+                }
+                .font(.footnote.weight(.medium).monospacedDigit())
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 10)
+                .glass(RoundedRectangle(cornerRadius: 16, style: .continuous))
+            }
+
             Seg(items: [(t("الأصل كما هو", "Keep original"), ProcessingMode.original),
                         (t("تحويل اختياري", "Convert"), ProcessingMode.convert)], sel: $mode)
 
@@ -201,6 +240,13 @@ struct ContentView: View {
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
                 Seg(items: [("4K", 3840), ("2K", 2560)], sel: $side)
+                if let videoInfo, side > videoInfo.longSide {
+                    Text(t("هذا الخيار سيكبّر الفيديو عن دقته الأصلية.",
+                           "This setting will upscale the video beyond its source resolution."))
+                        .font(.footnote)
+                        .foregroundStyle(.orange)
+                        .multilineTextAlignment(.center)
+                }
                 Seg(items: [("HEVC", Codec.hevc), ("H.264", Codec.h264)], sel: $codec)
                 Seg(items: [("25 Mbps", 25), ("40 Mbps", 40), ("60 Mbps", 60)], sel: $mbps)
             }
