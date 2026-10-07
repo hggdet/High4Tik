@@ -9,6 +9,13 @@ targets:
     platform: iOS
     sources:
       - App
+    info:
+      path: Config/Info.plist
+      properties:
+        UIBackgroundModes:
+          - processing
+        BGTaskSchedulerPermittedIdentifiers:
+          - com.abdtench.high4tik.process
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.abdtench.high4tik
