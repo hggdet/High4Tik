@@ -105,6 +105,7 @@ struct ContentView: View {
     @State private var item: PhotosPickerItem?
     @State private var movie: URL?
     @State private var thumb: UIImage?
+    @State private var mode: ProcessingMode = .original
     @State private var codec: Codec = .hevc
     @State private var side = 3840
     @State private var mbps = 40
@@ -184,9 +185,25 @@ struct ContentView: View {
             .disabled(busy || loading)
             .glass(RoundedRectangle(cornerRadius: 32, style: .continuous), interactive: true)
 
-            Seg(items: [("4K", 3840), ("2K", 2560)], sel: $side)
-            Seg(items: [("HEVC", Codec.hevc), ("H.264", Codec.h264)], sel: $codec)
-            Seg(items: [("25 Mbps", 25), ("40 Mbps", 40), ("60 Mbps", 60)], sel: $mbps)
+            Seg(items: [(t("الأصل كما هو", "Keep original"), ProcessingMode.original),
+                        (t("تحويل اختياري", "Convert"), ProcessingMode.convert)], sel: $mode)
+
+            if mode == .original {
+                Text(t("سيُحفظ الملف المحدد دون إعادة ترميز أو تغيير دقته من التطبيق.",
+                       "The selected file will be saved without re-encoding or changing its resolution."))
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+            } else {
+                Text(t("التحويل ينشئ نسخة جديدة وقد لا يضيف تفاصيل حقيقية للفيديو.",
+                       "Conversion creates a new copy and cannot add real detail to the video."))
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                Seg(items: [("4K", 3840), ("2K", 2560)], sel: $side)
+                Seg(items: [("HEVC", Codec.hevc), ("H.264", Codec.h264)], sel: $codec)
+                Seg(items: [("25 Mbps", 25), ("40 Mbps", 40), ("60 Mbps", 60)], sel: $mbps)
+            }
 
             actions.padding(.top, 6)
 
@@ -273,8 +290,17 @@ struct ContentView: View {
         let opt = Options(codec: codec, longSide: side, mbps: mbps)
         Task {
             do {
-                let out = try await Converter.run(input: input, opt: opt) { p in
-                    DispatchQueue.main.async { progress = p }
+                let out: URL
+                if mode == .original {
+                    let ext = input.pathExtension.isEmpty ? "mov" : input.pathExtension
+                    out = FileManager.default.temporaryDirectory
+                        .appendingPathComponent("High4Tik_original_\(UUID().uuidString).\(ext)")
+                    try FileManager.default.copyItem(at: input, to: out)
+                    progress = 0.9
+                } else {
+                    out = try await Converter.run(input: input, opt: opt) { p in
+                        DispatchQueue.main.async { progress = p }
+                    }
                 }
                 try await saveToPhotos(out)
                 result = out
@@ -306,6 +332,8 @@ struct ContentView: View {
 // MARK: - Converter
 
 enum Codec: String, CaseIterable { case hevc = "HEVC", h264 = "H.264" }
+
+enum ProcessingMode: Hashable { case original, convert }
 
 struct Options {
     var codec: Codec
