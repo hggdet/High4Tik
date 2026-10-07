@@ -6,14 +6,46 @@ import UIKit
 import VideoToolbox
 import CoreImage
 import CoreImage.CIFilterBuiltins
+import UserNotifications
+import BackgroundTasks
 
 // MARK: - App
 
 @main
 struct High4TikApp: App {
+    init() {
+        #if compiler(>=6.2)
+        if #available(iOS 26.0, *) {
+            BGTaskScheduler.shared.register(forTaskWithIdentifier: JobBridge.id, using: .main) { task in
+                guard let task = task as? BGContinuedProcessingTask else { return }
+                JobBridge.started = true
+                task.progress.totalUnitCount = 1000
+                task.expirationHandler = { Converter.cancelRequested = true }
+                guard let work = JobBridge.work else {
+                    task.setTaskCompleted(success: false)
+                    return
+                }
+                work({ p in task.progress.completedUnitCount = Int64(p * 1000) },
+                     { ok in task.setTaskCompleted(success: ok) })
+            }
+        }
+        #endif
+    }
+
     var body: some Scene {
         WindowGroup { ContentView() }
     }
+}
+
+// MARK: - Background job bridge
+
+typealias JobWork = (@escaping (Double) -> Void, @escaping (Bool) -> Void) -> Void
+
+enum JobBridge {
+    static let id = "com.abdtench.high4tik.process"
+    static var work: JobWork?
+    static var started = false
+    static var inBackground = false
 }
 
 // MARK: - Picked video
@@ -114,22 +146,94 @@ func makeThumb(_ url: URL) async -> UIImage? {
     return UIImage(cgImage: r.image)
 }
 
+// MARK: - Before / After
+
+/// Grabs the middle frame and crops the centre (same normalized area for both clips),
+/// so the zoomed comparison shows real detail differences.
+func frameCrop(_ url: URL) async -> UIImage? {
+    let asset = AVURLAsset(url: url)
+    guard let dur = try? await asset.load(.duration) else { return nil }
+    let g = AVAssetImageGenerator(asset: asset)
+    g.appliesPreferredTrackTransform = true
+    g.requestedTimeToleranceBefore = .zero
+    g.requestedTimeToleranceAfter = .zero
+    let t = CMTime(seconds: dur.seconds * 0.5, preferredTimescale: 600)
+    guard let r = try? await g.image(at: t) else { return nil }
+    let cg = r.image
+    let w = CGFloat(cg.width), h = CGFloat(cg.height)
+    let nw: CGFloat = 0.3
+    let nh: CGFloat = min(0.3 * w / h, 1)
+    let rect = CGRect(x: (1 - nw) / 2 * w, y: (1 - nh) / 2 * h, width: nw * w, height: nh * h)
+    guard let c = cg.cropping(to: rect.integral) else { return nil }
+    return UIImage(cgImage: c)
+}
+
+struct CompareView: View {
+    let before: UIImage
+    let after: UIImage
+    @State private var x: CGFloat = 0.5
+
+    var body: some View {
+        GeometryReader { geo in
+            let w = geo.size.width, h = geo.size.height
+            ZStack(alignment: .topLeading) {
+                Image(uiImage: after).resizable().scaledToFill()
+                    .frame(width: w, height: h).clipped()
+                Image(uiImage: before).resizable().scaledToFill()
+                    .frame(width: w, height: h).clipped()
+                    .mask(alignment: .leading) { Rectangle().frame(width: w * x) }
+                Rectangle().fill(Color.white).frame(width: 2, height: h)
+                    .offset(x: w * x - 1)
+                Circle().fill(Color.white).frame(width: 34, height: 34)
+                    .overlay(Image(systemName: "arrow.left.and.right")
+                        .font(.footnote.weight(.bold)).foregroundStyle(Color.black))
+                    .shadow(color: .black.opacity(0.25), radius: 6)
+                    .offset(x: w * x - 17, y: h / 2 - 17)
+                HStack {
+                    Text("Original").padding(.horizontal, 10).padding(.vertical, 5)
+                        .background(.ultraThinMaterial, in: Capsule())
+                    Spacer()
+                    Text("High4Tik").padding(.horizontal, 10).padding(.vertical, 5)
+                        .background(.ultraThinMaterial, in: Capsule())
+                }
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(Color.primary)
+                .padding(12)
+            }
+            .frame(width: w, height: h)
+            .clipShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
+            .contentShape(Rectangle())
+            .gesture(DragGesture(minimumDistance: 0).onChanged { v in
+                x = min(max(v.location.x / w, 0), 1)
+            })
+        }
+        .aspectRatio(1, contentMode: .fit)
+        .environment(\.layoutDirection, .leftToRight)
+    }
+}
+
 // MARK: - UI
 
 struct ContentView: View {
-    @State private var item: PhotosPickerItem?
-    @State private var movie: URL?
+    @State private var items: [PhotosPickerItem] = []
+    @State private var movies: [URL] = []
+    @State private var results: [URL] = []
     @State private var thumb: UIImage?
-    @State private var codec: Codec = .hevc
-    @State private var side = 3840
-    @State private var mbps = 40
-    @State private var sharpen = true
+    @AppStorage("codecRaw") private var codecRaw = Codec.hevc.rawValue
+    @AppStorage("side") private var side = 3840
+    @AppStorage("mbps") private var mbps = 40
+    @State private var clipDuration: Double = 0
+    @AppStorage("sharpen") private var sharpen = true
     @State private var progress = 0.0
     @State private var busy = false
     @State private var loading = false
     @State private var failed = false
     @State private var status = ""
     @State private var result: URL?
+    @State private var beforeImg: UIImage?
+    @State private var afterImg: UIImage?
+    @State private var showCompare = false
+    @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
         ZStack {
@@ -146,23 +250,49 @@ struct ContentView: View {
         }
         .fontDesign(.rounded)
         .environment(\.layoutDirection, isArabic ? .rightToLeft : .leftToRight)
-        .onChange(of: item) { new in
-            guard let new = new else { return }
+        .onChange(of: scenePhase) { phase in
+            JobBridge.inBackground = (phase != .active)
+            if phase == .background && busy && !JobBridge.started { notifyReturn() }
+        }
+        .sheet(isPresented: $showCompare) {
+            if let b = beforeImg, let a = afterImg {
+                VStack(spacing: 16) {
+                    Text(t("قبل / بعد (مقرّب)", "Before / After (zoomed)")).font(.headline)
+                    CompareView(before: b, after: a).padding(.horizontal, 20)
+                    Text(t("اسحب الخط", "Drag the line")).font(.footnote).foregroundStyle(.secondary)
+                    Spacer()
+                }
+                .padding(.top, 28)
+                .presentationDetents([.large])
+            }
+        }
+        .onChange(of: items) { new in
+            guard !new.isEmpty else { return }
             loading = true
             failed = false
             status = ""
             Task {
-                if let m = try? await new.loadTransferable(type: PickedMovie.self) {
-                    movie = m.url
-                    result = nil
-                    progress = 0
-                    thumb = await makeThumb(m.url)
-                } else {
+                var urls: [URL] = []
+                for it in new {
+                    if let m = try? await it.loadTransferable(type: PickedMovie.self) { urls.append(m.url) }
+                }
+                if urls.isEmpty {
                     failed = true
                     status = t("ما انحمّل المقطع، جرّب مرة ثانية", "Couldn't load the video, try again")
+                } else {
+                    movies = urls
+                    result = nil
+                    results = []
+                    progress = 0
+                    thumb = await makeThumb(urls[0])
+                    clipDuration = (try? await AVURLAsset(url: urls[0]).load(.duration).seconds) ?? 0
+                    if urls.count < new.count {
+                        failed = true
+                        status = t("انحمّل \(urls.count) من \(new.count)", "Loaded \(urls.count) of \(new.count)")
+                    }
                 }
                 loading = false
-                item = nil
+                items = []
             }
         }
     }
@@ -174,7 +304,7 @@ struct ContentView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.bottom, 4)
 
-            PhotosPicker(selection: $item, matching: .videos, preferredItemEncoding: .current) {
+            PhotosPicker(selection: $items, maxSelectionCount: 1, matching: .videos, preferredItemEncoding: .current) {
                 ZStack {
                     if let img = thumb {
                         Image(uiImage: img)
@@ -191,6 +321,19 @@ struct ContentView: View {
                         .foregroundStyle(Color.primary)
                     }
                     if loading { ProgressView().controlSize(.large) }
+                    if movies.count > 1 {
+                        VStack {
+                            HStack {
+                                Spacer()
+                                Text("×\(movies.count)")
+                                    .font(.footnote.weight(.bold))
+                                    .padding(.horizontal, 12).padding(.vertical, 6)
+                                    .background(.ultraThinMaterial, in: Capsule())
+                            }
+                            Spacer()
+                        }
+                        .padding(18)
+                    }
                 }
                 .frame(maxWidth: .infinity)
                 .frame(height: 280)
@@ -201,9 +344,17 @@ struct ContentView: View {
             .glass(RoundedRectangle(cornerRadius: 32, style: .continuous), interactive: true)
 
             Seg(items: [("4K", 3840), ("2K", 2560)], sel: $side)
-            Seg(items: [("HEVC", Codec.hevc), ("H.264", Codec.h264)], sel: $codec)
+            Seg(items: [("HEVC", Codec.hevc), ("H.264", Codec.h264)], sel: codecBinding)
             Seg(items: [("40 Mbps", 40), ("60 Mbps", 60)], sel: $mbps)
             Seg(items: [(t("حدة", "Sharp"), true), (t("بدون", "Off"), false)], sel: $sharpen)
+
+            if clipDuration > 0 && !movies.isEmpty && !busy {
+                Text(t("الحجم المتوقع ≈ \(Int(estMB)) MB", "Estimated size ≈ \(Int(estMB)) MB")
+                     + (capped ? t(" • الجودة محدودة لتبقى تحت 250MB", " • quality capped to stay under 250 MB") : ""))
+                    .font(.footnote)
+                    .foregroundStyle(Color.secondary)
+                    .multilineTextAlignment(.center)
+            }
 
             actions.padding(.top, 6)
 
@@ -260,49 +411,151 @@ struct ContentView: View {
                         .frame(height: 60)
                         .background(Color.primary, in: Capsule())
                 }
-                .disabled(movie == nil || loading)
-                .opacity(movie == nil ? 0.35 : 1)
+                .disabled(movies.isEmpty || loading)
+                .opacity(movies.isEmpty ? 0.35 : 1)
 
-                if let r = result {
-                    ShareLink(item: r) {
+                if !results.isEmpty {
+                    ShareLink(items: results) {
                         Image(systemName: "square.and.arrow.up")
                             .font(.title3.weight(.semibold))
                             .foregroundStyle(Color.primary)
                             .frame(width: 60, height: 60)
                     }
                     .glass(Circle(), interactive: true)
+                    if beforeImg != nil && afterImg != nil {
+                        Button { showCompare = true } label: {
+                            Image(systemName: "square.split.2x1")
+                                .font(.title3.weight(.semibold))
+                                .foregroundStyle(Color.primary)
+                                .frame(width: 60, height: 60)
+                        }
+                        .glass(Circle(), interactive: true)
+                    }
                 }
             }
         }
     }
 
+    var codec: Codec { Codec(rawValue: codecRaw) ?? .hevc }
+
+    /// TikTok's phone upload gets heavier compression on big files, so stay under ~250 MB
+    static let sizeCapMB = 250.0
+    var effMbps: Double {
+        guard clipDuration > 0 else { return Double(mbps) }
+        let cap = (Self.sizeCapMB * 8) / clipDuration - 0.2
+        return max(min(Double(mbps), cap), 6)
+    }
+    var capped: Bool { clipDuration > 0 && effMbps < Double(mbps) - 0.05 }
+    var estMB: Double { (effMbps * 1_000_000 + 192_000) * clipDuration / 8 / 1_000_000 }
+    var codecBinding: Binding<Codec> {
+        Binding(get: { codec }, set: { codecRaw = $0.rawValue })
+    }
+
+    func notifyDone(_ ok: Bool) {
+        guard UIApplication.shared.applicationState != .active else { return }
+        let c = UNMutableNotificationContent()
+        c.title = "High4Tik"
+        c.body = ok ? t("خلص المقطع وانحفظ بالصور", "Done — saved to Photos")
+                    : t("فشلت المعالجة", "Processing failed")
+        c.sound = .default
+        let req = UNNotificationRequest(
+            identifier: UUID().uuidString, content: c,
+            trigger: UNTimeIntervalNotificationTrigger(timeInterval: 1, repeats: false))
+        UNUserNotificationCenter.current().add(req)
+    }
+
+    func notifyReturn() {
+        let c = UNMutableNotificationContent()
+        c.title = "High4Tik"
+        c.body = t("ارجع للتطبيق حتى تكمل المعالجة", "Return to the app to finish processing")
+        c.sound = .default
+        let req = UNNotificationRequest(
+            identifier: "h4t.return", content: c,
+            trigger: UNTimeIntervalNotificationTrigger(timeInterval: 1, repeats: false))
+        UNUserNotificationCenter.current().add(req)
+    }
+
     func start() {
-        guard let input = movie else { return }
+        guard !movies.isEmpty else { return }
         busy = true
         failed = false
         result = nil
+        results = []
+        beforeImg = nil
+        afterImg = nil
         progress = 0
         status = t("خلّي التطبيق مفتوح", "Keep the app open")
         UIApplication.shared.isIdleTimerDisabled = true
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
+
+        #if compiler(>=6.2)
+        if #available(iOS 26.0, *) {
+            JobBridge.started = false
+            JobBridge.work = { report, done in runJob(report: report, done: done) }
+            let req = BGContinuedProcessingTaskRequest(
+                identifier: JobBridge.id,
+                title: "High4Tik",
+                subtitle: t("جاري المعالجة", "Processing"))
+            req.strategy = .fail
+            do {
+                try BGTaskScheduler.shared.submit(req)
+                status = t("تقدر تطلع من التطبيق", "You can leave the app")
+                // Safety net: if the system never starts the task, run normally
+                DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+                    if !JobBridge.started {
+                        JobBridge.work = nil
+                        status = t("خلّي التطبيق مفتوح", "Keep the app open")
+                        runJob(report: { _ in }, done: { _ in })
+                    }
+                }
+                return
+            } catch {
+                JobBridge.work = nil
+            }
+        }
+        #endif
+        runJob(report: { _ in }, done: { _ in })
+    }
+
+    func runJob(report: @escaping (Double) -> Void, done: @escaping (Bool) -> Void) {
+        let inputs = movies
+        let opt = Options(codec: codec, longSide: side, mbps: effMbps, sharpen: sharpen)
         var bg = UIBackgroundTaskIdentifier.invalid
         bg = UIApplication.shared.beginBackgroundTask { }
-        let opt = Options(codec: codec, longSide: side, mbps: mbps, sharpen: sharpen)
+        Converter.cancelRequested = false
         Task {
+            var outs: [URL] = []
+            var ok = false
             do {
-                let out = try await Converter.run(input: input, opt: opt) { p in
-                    DispatchQueue.main.async { progress = p }
+                for (i, input) in inputs.enumerated() {
+                    let out = try await Converter.run(input: input, opt: opt) { p in
+                        let total = (Double(i) + p) / Double(inputs.count)
+                        DispatchQueue.main.async {
+                            progress = total
+                            report(total)
+                        }
+                    }
+                    try await saveToPhotos(out)
+                    outs.append(out)
                 }
-                try await saveToPhotos(out)
-                result = out
+                notifyDone(true)
+                results = outs
+                result = outs.last
+                beforeImg = await frameCrop(inputs[0])
+                afterImg = await frameCrop(outs[0])
                 progress = 1
                 status = t("انحفظ بالصور", "Saved to Photos")
+                ok = true
             } catch {
                 failed = true
                 status = error.localizedDescription
+                notifyDone(false)
+                if !outs.isEmpty { results = outs; result = outs.last }
             }
             busy = false
             UIApplication.shared.isIdleTimerDisabled = false
             if bg != .invalid { UIApplication.shared.endBackgroundTask(bg) }
+            done(ok)
         }
     }
 
@@ -326,11 +579,12 @@ enum Codec: String, CaseIterable { case hevc = "HEVC", h264 = "H.264" }
 struct Options {
     var codec: Codec
     var longSide: Int
-    var mbps: Int
+    var mbps: Double
     var sharpen: Bool
 }
 
 enum Converter {
+    static var cancelRequested = false
     static func fail(_ m: String) -> NSError {
         NSError(domain: "h4t", code: 2, userInfo: [NSLocalizedDescriptionKey: m])
     }
@@ -379,6 +633,8 @@ enum Converter {
         } else {
             // SDR: Lanczos upscale (much crisper than bilinear) + very mild sharpening
             let ci = CIContext(options: [.workingFormat: CIFormat.RGBAh])
+            // The GPU is off-limits in the background, so render on the CPU there
+            let cpu = CIContext(options: [.workingFormat: CIFormat.RGBAh, .useSoftwareRenderer: true])
             let doSharpen = opt.sharpen
             let tw = CGFloat(W), th = CGFloat(H)
             comp = AVMutableVideoComposition(asset: asset) { req in
@@ -398,7 +654,7 @@ enum Converter {
                     out = um.outputImage ?? out
                 }
                 out = out.cropped(to: CGRect(x: 0, y: 0, width: tw, height: th))
-                req.finish(with: out, context: ci)
+                req.finish(with: out, context: JobBridge.inBackground ? cpu : ci)
             }
         }
         comp.renderSize = CGSize(width: W, height: H)
@@ -444,7 +700,7 @@ enum Converter {
         writer.shouldOptimizeForNetworkUse = true
 
         var props: [String: Any] = [
-            AVVideoAverageBitRateKey: opt.mbps * 1_000_000,
+            AVVideoAverageBitRateKey: Int(opt.mbps * 1_000_000),
             AVVideoExpectedSourceFrameRateKey: fps,
             AVVideoMaxKeyFrameIntervalKey: fps * 2
         ]
@@ -496,6 +752,9 @@ enum Converter {
                 group.enter()
                 input.requestMediaDataWhenReady(on: q) {
                     while input.isReadyForMoreMediaData {
+                        if Converter.cancelRequested {
+                            input.markAsFinished(); group.leave(); return
+                        }
                         if let sb = output.copyNextSampleBuffer() {
                             if video {
                                 let t = CMSampleBufferGetPresentationTimeStamp(sb).seconds
@@ -515,6 +774,12 @@ enum Converter {
             if let ai = aIn, let ao = aOut { pump(ai, ao, video: false) }
 
             group.notify(queue: q) {
+                if Converter.cancelRequested {
+                    reader.cancelReading()
+                    writer.cancelWriting()
+                    cont.resume(throwing: fail(t("توقفت المعالجة، ارجع للتطبيق وأعدها", "Processing stopped, reopen the app and retry")))
+                    return
+                }
                 if writer.status == .failed {
                     reader.cancelReading()
                     cont.resume(throwing: writer.error ?? fail("فشلت الكتابة"))
